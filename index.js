@@ -3,22 +3,118 @@ import { extension_settings, getContext } from "../../../extensions.js";
 import { saveSettingsDebounced, callPopup, getRequestHeaders, saveChat, reloadCurrentChat, saveCharacterDebounced } from "../../../../script.js";
 
 const extensionName = "st-persona-weaver";
-const CURRENT_VERSION = "3.4.6"; // Lifecycle/Timeline exception for not-yet-happened fields
+const CURRENT_VERSION = "3.5.0";
 
 const UPDATE_CHECK_URL = "https://raw.githubusercontent.com/sssilvia27/st-persona-weaver/main/manifest.json";
 
-// Storage Keys
-const STORAGE_KEY_HISTORY = 'pw_history_v29_new_template'; 
-const STORAGE_KEY_STATE = 'pw_state_v20';
-const STORAGE_KEY_TEMPLATE = 'pw_template_v6_new_yaml'; 
-const STORAGE_KEY_PROMPTS = 'pw_prompts_v21_restore_edit'; 
-const STORAGE_KEY_WI_STATE = 'pw_wi_selection_v1';
-const STORAGE_KEY_UI_STATE = 'pw_ui_state_v4_preset';          
-const STORAGE_KEY_THEMES = 'pw_custom_themes_v1'; 
-const STORAGE_KEY_DATA_USER = 'pw_data_user_v1'; 
-const STORAGE_KEY_DATA_NPC = 'pw_data_npc_v1';
-const STORAGE_KEY_PINNED_BOOKS = 'pw_pinned_books_v1';
-const STORAGE_KEY_AVATAR_IMAGES = 'pw_avatar_images_v1';
+// ============================================================
+// Storage: extension_settings (server-side persistent, cross-device)
+// ============================================================
+
+function initExtensionSettings() {
+    if (!extension_settings[extensionName]) {
+        extension_settings[extensionName] = {};
+    }
+    const s = extension_settings[extensionName];
+    if (!Object.hasOwn(s, 'history')) s.history = [];
+    if (!Object.hasOwn(s, 'prompts')) s.prompts = null;
+    if (!Object.hasOwn(s, 'themes')) s.themes = {};
+    if (!Object.hasOwn(s, 'avatarImages')) s.avatarImages = [];
+    if (!Object.hasOwn(s, 'wiSelection')) s.wiSelection = {};
+    if (!Object.hasOwn(s, 'pinnedBooks')) s.pinnedBooks = [];
+    if (!Object.hasOwn(s, 'userContext')) s.userContext = { template: defaultYamlTemplate, request: "", result: "", hasResult: false };
+    if (!Object.hasOwn(s, 'npcContext')) s.npcContext = { template: defaultNpcTemplate, request: "", result: "", hasResult: false };
+    if (!Object.hasOwn(s, 'apiConfig')) s.apiConfig = {};
+    return s;
+}
+
+function getSettings() {
+    if (!extension_settings[extensionName]) {
+        return initExtensionSettings();
+    }
+    return extension_settings[extensionName];
+}
+
+function saveAllSettings() {
+    saveSettingsDebounced();
+}
+
+function migrateFromLocalStorage() {
+    const s = getSettings();
+    if (s._migrated_v2) return;
+    let migrated = false;
+
+    const tryMigrate = (legacyKey, targetKey, fallback) => {
+        try {
+            const raw = localStorage.getItem(legacyKey);
+            if (raw !== null && raw !== undefined) {
+                const data = JSON.parse(raw);
+                if (data !== null && data !== undefined) {
+                    s[targetKey] = data;
+                    migrated = true;
+                    console.log(`[PW] Migrated ${legacyKey} → extension_settings.${targetKey}`);
+                    return true;
+                }
+            }
+        } catch (e) { /* ignore parse errors */ }
+        return false;
+    };
+
+    tryMigrate('pw_history_v29_new_template', 'history', []);
+    tryMigrate('pw_prompts_v21_restore_edit', 'prompts', null);
+    tryMigrate('pw_custom_themes_v1', 'themes', {});
+    tryMigrate('pw_avatar_images_v1', 'avatarImages', []);
+    tryMigrate('pw_wi_selection_v1', 'wiSelection', {});
+    tryMigrate('pw_pinned_books_v1', 'pinnedBooks', []);
+    tryMigrate('pw_data_user_v1', 'userContext', { template: defaultYamlTemplate, request: "", result: "", hasResult: false });
+    tryMigrate('pw_data_npc_v1', 'npcContext', { template: defaultNpcTemplate, request: "", result: "", hasResult: false });
+
+    // migrate state (apiConfig)
+    try {
+        const stateRaw = localStorage.getItem('pw_state_v20');
+        if (stateRaw) {
+            const stateData = JSON.parse(stateRaw);
+            if (stateData && stateData.localConfig) {
+                s.apiConfig = stateData.localConfig;
+                migrated = true;
+                console.log('[PW] Migrated pw_state_v20.localConfig → extension_settings.apiConfig');
+            }
+        }
+    } catch (e) { /* ignore */ }
+
+    // migrate UI state
+    try {
+        const uiRaw = localStorage.getItem('pw_ui_state_v4_preset');
+        if (uiRaw) {
+            const uiData = JSON.parse(uiRaw);
+            if (uiData) {
+                s.uiState = uiData;
+                migrated = true;
+                console.log('[PW] Migrated pw_ui_state_v4_preset → extension_settings.uiState');
+            }
+        }
+    } catch (e) { /* ignore */ }
+
+    // migrate old template
+    if (!s.userContext || !s.userContext.template || s.userContext.template === defaultYamlTemplate) {
+        try {
+            const oldT = localStorage.getItem('pw_template_v6_new_yaml');
+            if (oldT && oldT.length > 50) {
+                s.userContext = s.userContext || { template: defaultYamlTemplate, request: "", result: "", hasResult: false };
+                s.userContext.template = oldT;
+                migrated = true;
+                console.log('[PW] Migrated pw_template_v6_new_yaml → extension_settings.userContext.template');
+            }
+        } catch (e) { /* ignore */ }
+    }
+
+    s._migrated_v2 = true;
+    if (migrated) {
+        saveAllSettings();
+        toastr.info('Persona Weaver: 数据已从本地存储迁移至服务端，现在可在不同设备间同步。');
+        console.log('[PW] Migration from localStorage to extension_settings complete.');
+    }
+}
 
 const BUTTON_ID = 'pw_persona_tool_btn';
 const HISTORY_PER_PAGE = 20;
@@ -1290,30 +1386,17 @@ async function runGeneration(data, apiConfig, isTemplateMode = false) {
 // 存储与系统函数
 // ============================================================================
 
-function safeLocalStorageSet(key, value) {
-    try {
-        localStorage.setItem(key, value);
-    } catch (e) {
-        if (e.name === 'QuotaExceededError' || e.name === 'NS_ERROR_DOM_QUOTA_REACHED') {
-            toastr.error(TEXT.TOAST_QUOTA_ERROR);
-        }
-    }
-}
-
 function loadData() {
-    try { historyCache = JSON.parse(localStorage.getItem(STORAGE_KEY_HISTORY)) || []; } catch { historyCache = []; }
+    const s = getSettings();
+
+    historyCache = s.history || [];
     try {
-        const p = JSON.parse(localStorage.getItem(STORAGE_KEY_PROMPTS));
+        const p = s.prompts;
         const migrateTemplatePrompt = (stored, def) =>
             (stored && stored.includes('{{userRequirements}}')) ? stored : def;
-        // v3.4.6 引入的"生命周期/时间线豁免"标识，用于识别旧版默认值
         const V345_PROHIBIT_SIG = 'Do NOT output empty strings, "未知", "unknown", "N/A", "待定", "TBD", "暂无", null, "-", or placeholders.';
-        const hasLifecycleExc = (s) => s.includes('LIFECYCLE / TIMELINE EXCEPTION') || s.includes('尚未发生（角色');
+        const hasLifecycleExc = (src) => src.includes('LIFECYCLE / TIMELINE EXCEPTION') || src.includes('尚未发生（角色');
 
-        // 聊天推断 Prompt 迁移：
-        //  - v3.4.3 及更早旧版（无 MANDATORY COMPLETENESS）→ 升级到新默认
-        //  - v3.4.4/v3.4.5 旧默认（有 MANDATORY 但无 LIFECYCLE EXCEPTION，且保留 v3.4.5 原句）→ 升级到新默认
-        //  - 用户深度自定义 → 保留
         const migrateChatInferPrompt = (stored, def) => {
             if (!stored) return def;
             const hasOldRule = stored.includes('Base the profile ONLY on evidence from the chat history. Do NOT invent unsupported traits.')
@@ -1323,11 +1406,6 @@ function loadData() {
             if (hasNewGuard && !hasLifecycleExc(stored) && stored.includes(V345_PROHIBIT_SIG)) return def;
             return stored;
         };
-        // 生成/润色 Prompt 迁移：
-        //  - v3.4.3 及更早默认（无 MANDATORY COMPLETENESS / 无 PATCH MODE）→ 升级，修复纯润色字段被清空
-        //  - v3.4.4/v3.4.5 旧默认（有 MANDATORY 但无 LIFECYCLE EXCEPTION，且保留 v3.4.5 原句）→ 升级，
-        //    解决"角色未到中年阶段时字段被强行编造"以及自定义模板里同类时间锁字段的问题
-        //  - 用户深度自定义内容保持不变
         const migrateGenPrompt = (stored, def, signature) => {
             if (!stored) return def;
             const hasNewGuard = stored.includes('MANDATORY COMPLETENESS') || stored.includes('NEVER leave any field blank');
@@ -1362,46 +1440,34 @@ function loadData() {
             initial: fallbackSystemPrompt 
         }; 
     }
-    try { wiSelectionCache = JSON.parse(localStorage.getItem(STORAGE_KEY_WI_STATE)) || {}; } catch { wiSelectionCache = {}; }
+
+    wiSelectionCache = s.wiSelection || {};
     
-    // [Updated] Load UI State with Preset info + chatHistory config
     const defaultUiState = { templateExpanded: true, theme: 'style.css', generationMode: 'user', generationPreset: 'current', avatarRef: { enabled: false, selectedIds: [] }, chatHistory: { enabled: false, preset: '20', floorFrom: '', floorTo: '', excludeTags: [], includeTags: [] } };
-    try {
-        uiStateCache = JSON.parse(localStorage.getItem(STORAGE_KEY_UI_STATE)) || defaultUiState;
-        if (!uiStateCache.chatHistory) uiStateCache.chatHistory = { enabled: false, preset: '20', floorFrom: '', floorTo: '', excludeTags: [], includeTags: [] };
-        if (!uiStateCache.avatarRef || typeof uiStateCache.avatarRef === 'boolean') {
-            uiStateCache.avatarRef = { enabled: !!uiStateCache.avatarRef, selectedIds: [] };
-        } else if (!Array.isArray(uiStateCache.avatarRef.selectedIds)) {
-            uiStateCache.avatarRef.selectedIds = [];
-        }
-    } catch { uiStateCache = defaultUiState; }
-    
-    try { avatarImagesCache = JSON.parse(localStorage.getItem(STORAGE_KEY_AVATAR_IMAGES)) || []; } catch { avatarImagesCache = []; }
-    try { customThemes = JSON.parse(localStorage.getItem(STORAGE_KEY_THEMES)) || {}; } catch { customThemes = {}; }
+    uiStateCache = s.uiState || defaultUiState;
+    if (!uiStateCache.chatHistory) uiStateCache.chatHistory = { enabled: false, preset: '20', floorFrom: '', floorTo: '', excludeTags: [], includeTags: [] };
+    if (!uiStateCache.avatarRef || typeof uiStateCache.avatarRef === 'boolean') {
+        uiStateCache.avatarRef = { enabled: !!uiStateCache.avatarRef, selectedIds: [] };
+    } else if (!Array.isArray(uiStateCache.avatarRef.selectedIds)) {
+        uiStateCache.avatarRef.selectedIds = [];
+    }
 
-    // Load Isolated Context Data
-    try {
-        const u = JSON.parse(localStorage.getItem(STORAGE_KEY_DATA_USER));
-        userContext = u || { template: defaultYamlTemplate, request: "", result: "", hasResult: false };
-        if(!u) {
-            const oldT = localStorage.getItem(STORAGE_KEY_TEMPLATE);
-            if(oldT && oldT.length > 50) userContext.template = oldT;
-        }
-    } catch { userContext = { template: defaultYamlTemplate, request: "", result: "", hasResult: false }; }
+    avatarImagesCache = s.avatarImages || [];
+    customThemes = s.themes || {};
 
-    try {
-        const n = JSON.parse(localStorage.getItem(STORAGE_KEY_DATA_NPC));
-        npcContext = n || { template: defaultNpcTemplate, request: "", result: "", hasResult: false };
-    } catch { npcContext = { template: defaultNpcTemplate, request: "", result: "", hasResult: false }; }
+    userContext = s.userContext || { template: defaultYamlTemplate, request: "", result: "", hasResult: false };
+    npcContext = s.npcContext || { template: defaultNpcTemplate, request: "", result: "", hasResult: false };
 }
 
 function saveData() {
-    safeLocalStorageSet(STORAGE_KEY_HISTORY, JSON.stringify(historyCache));
-    safeLocalStorageSet(STORAGE_KEY_PROMPTS, JSON.stringify(promptsCache));
-    safeLocalStorageSet(STORAGE_KEY_UI_STATE, JSON.stringify(uiStateCache));
-    safeLocalStorageSet(STORAGE_KEY_THEMES, JSON.stringify(customThemes));
-    safeLocalStorageSet(STORAGE_KEY_DATA_USER, JSON.stringify(userContext));
-    safeLocalStorageSet(STORAGE_KEY_DATA_NPC, JSON.stringify(npcContext));
+    const s = getSettings();
+    s.history = historyCache;
+    s.prompts = promptsCache;
+    s.uiState = uiStateCache;
+    s.themes = customThemes;
+    s.userContext = userContext;
+    s.npcContext = npcContext;
+    saveAllSettings();
 }
 
 function saveHistory(item) {
@@ -1456,11 +1522,20 @@ function saveWiSelection(bookName, uids) {
     const charKey = getWiCacheKey();
     if (!wiSelectionCache[charKey]) wiSelectionCache[charKey] = {};
     wiSelectionCache[charKey][bookName] = uids;
-    safeLocalStorageSet(STORAGE_KEY_WI_STATE, JSON.stringify(wiSelectionCache));
+    const s = getSettings();
+    s.wiSelection = wiSelectionCache;
+    saveAllSettings();
 }
 
-function saveState(data) { safeLocalStorageSet(STORAGE_KEY_STATE, JSON.stringify(data)); }
-function loadState() { try { return JSON.parse(localStorage.getItem(STORAGE_KEY_STATE)) || {}; } catch { return {}; } }
+function saveState(data) {
+    const s = getSettings();
+    s.apiConfig = data.localConfig || data;
+    saveAllSettings();
+}
+function loadState() {
+    const s = getSettings();
+    return { localConfig: s.apiConfig || {} };
+}
 
 // 读取独立 API 的请求超时（秒）。优先级：DOM 输入 > 已保存配置 > defaultSettings > 硬编码 300。
 // 做了 30–1800 秒的区间夹取，避免用户写 0 / 几秒这种废值把请求立刻打挂。
@@ -1632,7 +1707,11 @@ async function readSSEResponse(res, isAnthropic, onDelta) {
     return fullText;
 }
 
-function saveAvatarImages() { safeLocalStorageSet(STORAGE_KEY_AVATAR_IMAGES, JSON.stringify(avatarImagesCache)); }
+function saveAvatarImages() {
+    const s = getSettings();
+    s.avatarImages = avatarImagesCache;
+    saveAllSettings();
+}
 function generateId() { return Date.now().toString(36) + Math.random().toString(36).substr(2, 5); }
 
 function compressImage(base64, maxSize = 512, quality = 0.7) {
@@ -1951,7 +2030,7 @@ async function openCreatorPopup() {
     }
     // -------------------------------------
 
-    const config = { ...defaultSettings, ...extension_settings[extensionName], ...savedState.localConfig };
+    const config = { ...defaultSettings, ...savedState.localConfig };
 
     let currentName = $('.persona_name').first().text().trim();
     if (!currentName) currentName = $('h5#your_name').text().trim();
@@ -2924,7 +3003,7 @@ function bindEvents() {
             const parts = [];
             if (sel.avatars)  { exportData.avatars = avatarImagesCache || []; parts.push(`${exportData.avatars.length} 头像`); }
             if (sel.history)  { exportData.history = historyCache || []; parts.push(`${exportData.history.length} 存档`); }
-            if (sel.prompts)  { try { exportData.prompts = JSON.parse(localStorage.getItem(STORAGE_KEY_PROMPTS)); } catch {} parts.push('Prompt'); }
+            if (sel.prompts)  { exportData.prompts = promptsCache || {}; parts.push('Prompt'); }
             if (sel.themes)   { exportData.themes = customThemes || {}; parts.push('主题'); }
             const blob = new Blob([JSON.stringify(exportData)], { type: 'application/json' });
             const url = URL.createObjectURL(blob);
@@ -2960,19 +3039,18 @@ function bindEvents() {
                 }
                 if (sel.history && data.history?.length) {
                     historyCache = data.history;
-                    safeLocalStorageSet(STORAGE_KEY_HISTORY, JSON.stringify(historyCache));
                     parts.push(`${data.history.length} 存档`);
                 }
                 if (sel.prompts && data.prompts) {
-                    safeLocalStorageSet(STORAGE_KEY_PROMPTS, JSON.stringify(data.prompts));
+                    promptsCache = { ...promptsCache, ...data.prompts };
                     parts.push('Prompt');
                 }
                 if (sel.themes && data.themes && Object.keys(data.themes).length) {
                     Object.assign(customThemes, data.themes);
-                    safeLocalStorageSet(STORAGE_KEY_THEMES, JSON.stringify(customThemes));
                     parts.push('主题');
                 }
                 if (parts.length === 0) { toastr.info('备份中无匹配的勾选内容'); return; }
+                saveData();
                 toastr.success(`已导入: ${parts.join(', ')}`);
                 renderAvatarMgmt();
                 renderAvatarStrip();
@@ -4485,12 +4563,13 @@ function renderApiProfiles() {
 
 window.pwExtraBooks = [];
 window.pwPinnedBooks = [];
-try { window.pwPinnedBooks = JSON.parse(localStorage.getItem(STORAGE_KEY_PINNED_BOOKS)) || []; } catch { window.pwPinnedBooks = []; }
-// Merge pinned books into extra on init
+window.pwPinnedBooks = getSettings().pinnedBooks || [];
 window.pwExtraBooks = [...window.pwPinnedBooks];
 
 function savePinnedBooks() {
-    try { localStorage.setItem(STORAGE_KEY_PINNED_BOOKS, JSON.stringify(window.pwPinnedBooks)); } catch(e) { console.warn(e); }
+    const s = getSettings();
+    s.pinnedBooks = window.pwPinnedBooks;
+    saveAllSettings();
 }
 
 const renderWiBooks = async () => {
@@ -4810,8 +4889,10 @@ function addPersonaButton() {
 }
 
 jQuery(async () => {
+    initExtensionSettings();
+    migrateFromLocalStorage();
     addPersonaButton(); 
     bindEvents(); 
-    loadThemeCSS('style.css'); // Default theme
-    console.log("[PW] Persona Weaver Loaded (v2.7.2 - Hotfix)");
+    loadThemeCSS('style.css');
+    console.log("[PW] Persona Weaver Loaded (v3.5.0)");
 });

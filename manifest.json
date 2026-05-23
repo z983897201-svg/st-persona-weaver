@@ -2,12 +2,12 @@
 {
     "display_name": "Persona Weaver (User人设生成器)",
     "name": "st-persona-weaver",
-    "version": "3.4.6",
+    "version": "3.5.0",
     "author": "Yellows & AI",
     "description": "AI辅助生成与润色User/NPC设定",
     "js": "index.js",
     "css": "style.css",
     "type": "extension",
-    "notes": "v3.4.6 更新：\n1.独立 API 与主 API 支持流式输出\n2.修复使用剧情推断时部分条目为空的情况\n3.修复纯润色时未涉及字段被清空或被替换为占位符的问题"
+    "notes": "v3.5.0 更新：\n1.数据存储从浏览器 localStorage 迁移至 extension_settings（服务端持久化，多设备同步）\n2.首次启动会自动将旧数据迁移至新存储\n3.独立 API 与主 API 支持流式输出\n4.修复使用剧情推断时部分条目为空的情况\n5.修复纯润色时未涉及字段被清空或被替换为占位符的问题"
 }
 
